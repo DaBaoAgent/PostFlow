@@ -1,3 +1,11 @@
+<!-- README-PROMO:START -->
+<p align="center">
+  <img src="assets/readme/hero.webp" alt="PostFlow：一条命令将视频和图文自动分发到多个社交媒体平台" width="100%" />
+  <img src="assets/readme/workflow.webp" alt="PostFlow 工作流：准备内容、账号登录、拟人发布与多平台分发" width="100%" />
+  <img src="assets/readme/beginner.webp" alt="PostFlow 新手上手：登录一次，通过命令行定时发布到七个平台" width="100%" />
+</p>
+<!-- README-PROMO:END -->
+
 # 🚀 PostFlow — 一键分发，流量自来
 
 <h4 align="center">Multi-Platform Social Media Auto Publisher | 多平台社交媒体自动发布工具</h4>
