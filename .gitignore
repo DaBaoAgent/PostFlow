@@ -188,4 +188,7 @@ cookiesFile
 uploadFile
 videoFile
 
+# 运行日志与调试截图（uv pip install -e . 后一跑就会生成）
+logs/
+
 /uploader/bilibili_uploader/qrcode.png

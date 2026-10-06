@@ -61,6 +61,7 @@ class DouyinVideoUploadRequest:
     publish_strategy: str = DOUYIN_PUBLISH_STRATEGY_IMMEDIATE
     debug: bool = True
     headless: bool = True
+    dry_run: bool = False
 
 
 @dataclass(slots=True)
@@ -75,6 +76,7 @@ class DouyinNoteUploadRequest:
     debug: bool = True
     headless: bool = True
     location: str = ""
+    dry_run: bool = False
 
 
 @dataclass(slots=True)
@@ -302,6 +304,7 @@ async def upload_video(request: DouyinVideoUploadRequest) -> Path:
         publish_strategy=request.publish_strategy,
         debug=request.debug,
         headless=request.headless,
+        dry_run=request.dry_run,
     )
     await app.douyin_upload_video()
     return account_file
@@ -326,6 +329,7 @@ async def upload_note(request: DouyinNoteUploadRequest) -> Path:
         debug=request.debug,
         headless=request.headless,
         location=request.location,
+        dry_run=request.dry_run,
     )
     await app.douyin_upload_note()
     return account_file
@@ -544,6 +548,11 @@ def build_parser() -> argparse.ArgumentParser:
     upload_video_parser.add_argument("--thumbnail-portrait", type=existing_file_path, help="Optional 3:4 portrait thumbnail path")
     upload_video_parser.add_argument("--product-link", default="", help="Optional product link")
     upload_video_parser.add_argument("--product-title", default="", help="Optional product title")
+    upload_video_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Dry run: upload + fill everything, but never click the publish button",
+    )
     add_runtime_flags(upload_video_parser)
 
     upload_note_parser = douyin_actions.add_parser("upload-note", help="Upload one note to Douyin")
@@ -554,6 +563,11 @@ def build_parser() -> argparse.ArgumentParser:
     upload_note_parser.add_argument("--tags", default="", help="Comma-separated tags, such as tag1,tag2")
     upload_note_parser.add_argument("--schedule", type=schedule_value, help=f"Schedule time in {schedule_help}")
     upload_note_parser.add_argument("--location", default="", help="Add a location/POI to the note")
+    upload_note_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Dry run: upload + fill everything, but never click the publish button",
+    )
     add_runtime_flags(upload_note_parser)
 
     kuaishou_parser = platform_parsers.add_parser("kuaishou", help="Kuaishou operations")
@@ -687,6 +701,7 @@ async def dispatch(args: argparse.Namespace) -> int:
                 publish_strategy=publish_strategy,
                 debug=args.debug,
                 headless=args.headless,
+                dry_run=args.dry_run,
             )
             await upload_video(request)
             print(f"Douyin video upload submitted: {request.video_file}")
@@ -704,6 +719,7 @@ async def dispatch(args: argparse.Namespace) -> int:
                 debug=args.debug,
                 headless=args.headless,
                 location=args.location or "",
+                dry_run=args.dry_run,
             )
             await upload_note(request)
             print(f"Douyin note upload submitted: {len(request.image_files)} images")

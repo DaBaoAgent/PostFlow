@@ -11,7 +11,7 @@ from patchright.async_api import Page
 from patchright.async_api import Playwright
 from patchright.async_api import async_playwright
 
-from conf import DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
+from conf import BASE_DIR, DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from uploader.base_video import BaseVideoUploader
 from utils.base_social_media import set_init_script
 from utils.login_qrcode import build_login_qrcode_path
@@ -49,9 +49,37 @@ def _build_login_result(success: bool, status: str, message: str, account_file: 
     }
 
 
+async def _launch_browser(playwright: Playwright, headless: bool):
+    """按「conf 里指定的 Chrome → 系统 Chrome → 内置 Chromium」顺序启动浏览器。
+
+    任一方式成功即返回；全部失败才抛错，并把每次失败原因打出来，方便定位。
+    """
+    attempts: list[tuple[str, dict]] = []
+    if LOCAL_CHROME_PATH:
+        attempts.append((f"conf.LOCAL_CHROME_PATH={LOCAL_CHROME_PATH}", {"executable_path": LOCAL_CHROME_PATH}))
+    attempts.append(("系统 Chrome (channel='chrome')", {"channel": "chrome"}))
+    attempts.append(("内置 Chromium (patchright 自带)", {}))
+
+    last_error: Exception | None = None
+    for label, launch_kwargs in attempts:
+        try:
+            browser = await playwright.chromium.launch(headless=headless, **launch_kwargs)
+        except Exception as exc:
+            last_error = exc
+            douyin_logger.warning(_msg("😵", f"浏览器启动失败：{label} —— {str(exc).splitlines()[0][:200]}"))
+            continue
+        douyin_logger.info(_msg("🌐", f"浏览器已启动：{label}（headless={headless}）"))
+        return browser
+
+    raise RuntimeError(
+        "没有可用的浏览器。请安装 Google Chrome，或在 conf.py 里设置 LOCAL_CHROME_PATH，"
+        f"或执行 `patchright install chromium`。最后一次错误: {last_error}"
+    )
+
+
 async def cookie_auth(account_file):
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=True, channel="chrome")
+        browser = await _launch_browser(playwright, headless=True)
         try:
             context = await browser.new_context(storage_state=account_file)
             context = await set_init_script(context)
@@ -177,7 +205,7 @@ async def douyin_cookie_gen(
     headless: bool = LOCAL_CHROME_HEADLESS,
 ):
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=headless, channel="chrome")
+        browser = await _launch_browser(playwright, headless=headless)
         context = await browser.new_context()
         context = await set_init_script(context)
         qrcode_path = None
@@ -211,8 +239,12 @@ async def douyin_cookie_gen(
         except Exception as exc:
             result = _build_login_result(False, "failed", str(exc), account_file, current_url=page.url if "page" in locals() else "")
         finally:
-            if remove_qrcode_file(qrcode_path):
-                douyin_logger.info(_msg("🧹", f"临时二维码文件已清理: {qrcode_path}"))
+            if qrcode_path and qrcode_path.exists():
+                if result["success"]:
+                    if remove_qrcode_file(qrcode_path):
+                        douyin_logger.info(_msg("🧹", f"临时二维码文件已清理: {qrcode_path}"))
+                else:
+                    douyin_logger.warning(_msg("🖼️", f"登录未完成，二维码图片已保留，可再打开扫码: {qrcode_path}"))
             if not result["success"]:
                 douyin_logger.error(_msg("😢", f"登录失败: {result['message']}"))
             await context.close()
@@ -228,6 +260,7 @@ class DouYinBaseUploader(BaseVideoUploader):
         publish_strategy: str = DOUYIN_PUBLISH_STRATEGY_IMMEDIATE,
         debug: bool = DEBUG_MODE,
         headless: bool = LOCAL_CHROME_HEADLESS,
+        dry_run: bool = False,
     ):
         self.publish_date = publish_date
         self.account_file = account_file
@@ -236,6 +269,45 @@ class DouYinBaseUploader(BaseVideoUploader):
         self.date_format = "%Y年%m月%d日 %H:%M"
         self.local_executable_path = LOCAL_CHROME_PATH
         self.headless = headless
+        # dry_run=True：完整跑完上传+填文案+设封面，但绝不点击「发布」
+        self.dry_run = dry_run
+        # 等待上限：选择器失效时不再无限空转，而是带着截图与错误信息退出
+        self.upload_timeout_seconds = 1800
+        self.publish_timeout_seconds = 600
+
+    @property
+    def account_stem(self) -> str:
+        return Path(self.account_file).stem
+
+    async def save_debug_screenshot(self, page: Page, reason: str = "") -> Path | None:
+        """把调试截图真正落盘。
+
+        原实现是 `await page.screenshot(full_page=True)`——少了 path 参数，
+        Playwright 只会返回 bytes，什么都不写，等于没有调试截图。
+        """
+        try:
+            debug_dir = Path(BASE_DIR) / "logs" / "debug"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            suffix = f"_{reason}" if reason else ""
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = debug_dir / f"douyin_{self.account_stem}_{timestamp}{suffix}.png"
+            await page.screenshot(path=str(path), full_page=True)
+            douyin_logger.info(_msg("📸", f"调试截图已保存: {path}"))
+            return path
+        except Exception as exc:
+            douyin_logger.warning(_msg("😵", f"调试截图保存失败: {exc}"))
+            return None
+
+    async def finish_dry_run(self, page: Page, context, browser, kind: str) -> None:
+        """干跑收尾：截图留证、绝不点击「发布」、不写回 cookie。"""
+        shot = await self.save_debug_screenshot(page, "dry_run")
+        douyin_logger.warning(
+            _msg("🧪", f"[DRY-RUN] {kind}已上传、文案/封面/定时都已填好，但**没有点击「发布」按钮**——不会真的发出去")
+        )
+        douyin_logger.info(_msg("📸", f"[DRY-RUN] 发布页截图（可核对文案是否填对）: {shot}"))
+        await asyncio.sleep(1)
+        await context.close()
+        await browser.close()
 
     async def validate_base_args(self):
         if not os.path.exists(self.account_file):
@@ -460,6 +532,7 @@ class DouYinVideo(DouYinBaseUploader):
         publish_strategy: str = DOUYIN_PUBLISH_STRATEGY_IMMEDIATE,
         debug: bool = DEBUG_MODE,
         headless: bool = LOCAL_CHROME_HEADLESS,
+        dry_run: bool = False,
     ):
         super().__init__(
             publish_date=publish_date,
@@ -467,6 +540,7 @@ class DouYinVideo(DouYinBaseUploader):
             publish_strategy=publish_strategy,
             debug=debug,
             headless=headless,
+            dry_run=dry_run,
         )
         self.title = title
         self.file_path = file_path
@@ -547,7 +621,7 @@ class DouYinVideo(DouYinBaseUploader):
         await self.validate_upload_args()
         douyin_logger.info(_msg("🥳", "上传前检查通过"))
 
-        browser = await playwright.chromium.launch(headless=self.headless, channel="chrome")
+        browser = await _launch_browser(playwright, headless=self.headless)
         context = await browser.new_context(
             storage_state=f"{self.account_file}",
             permissions=["geolocation"],
@@ -561,6 +635,7 @@ class DouYinVideo(DouYinBaseUploader):
         await page.wait_for_url("https://creator.douyin.com/creator-micro/content/upload")
         await page.locator("div[class^='container'] input").set_input_files(self.file_path)
 
+        enter_publish_deadline = asyncio.get_running_loop().time() + self.publish_timeout_seconds
         while True:
             try:
                 await page.wait_for_url(
@@ -578,6 +653,13 @@ class DouYinVideo(DouYinBaseUploader):
                     douyin_logger.info(_msg("🥳", "已经进入 version_2 发布页面"))
                     break
                 except Exception:
+                    if asyncio.get_running_loop().time() > enter_publish_deadline:
+                        if self.debug:
+                            await self.save_debug_screenshot(page, "enter_publish_timeout")
+                        raise RuntimeError(
+                            f"选中视频文件后超过 {self.publish_timeout_seconds}s 仍未进入发布页，"
+                            "可能是抖音上传入口改版；调试截图见 logs/debug/"
+                        )
                     douyin_logger.debug(_msg("🧍", "还没进到视频发布页面，小人继续等一会"))
                     await asyncio.sleep(0.5)
 
@@ -586,17 +668,27 @@ class DouYinVideo(DouYinBaseUploader):
         await self.fill_title_and_description(page, self.title, self.desc or self.title, self.tags)
         douyin_logger.info(_msg("🏷️", f"小人一共贴了 {len(self.tags)} 个话题"))
 
+        upload_deadline = asyncio.get_running_loop().time() + self.upload_timeout_seconds
         while True:
             try:
                 number = await page.locator('[class^="long-card"] div:has-text("重新上传")').count()
                 if number > 0:
                     douyin_logger.success(_msg("🥳", "视频已经传完啦"))
                     break
+                if asyncio.get_running_loop().time() > upload_deadline:
+                    if self.debug:
+                        await self.save_debug_screenshot(page, "upload_timeout")
+                    raise RuntimeError(
+                        f"等待视频上传完成超过 {self.upload_timeout_seconds}s 仍未结束"
+                        "（可能是抖音页面改版或网络异常），已放弃本次发布；调试截图见 logs/debug/"
+                    )
                 douyin_logger.info(_msg("🏃", "小人正在努力上传视频"))
                 await asyncio.sleep(2)
                 if await page.locator('div.progress-div > div:has-text("上传失败")').count():
                     douyin_logger.error(_msg("😵", "检测到上传失败，小人准备重试"))
                     await self.handle_upload_error(page)
+            except RuntimeError:
+                raise
             except Exception:
                 douyin_logger.debug(_msg("🧍", "小人还在等视频上传完成"))
                 await asyncio.sleep(2)
@@ -618,6 +710,11 @@ class DouYinVideo(DouYinBaseUploader):
         if self.publish_strategy == DOUYIN_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
             await self.set_schedule_time_douyin(page, self.publish_date)
 
+        if self.dry_run:
+            await self.finish_dry_run(page, context, browser, "视频")
+            return
+
+        publish_deadline = asyncio.get_running_loop().time() + self.publish_timeout_seconds
         while True:
             try:
                 publish_button = page.get_by_role("button", name="发布", exact=True)
@@ -631,9 +728,14 @@ class DouYinVideo(DouYinBaseUploader):
                 break
             except Exception:
                 await self.handle_auto_video_cover(page)
+                if asyncio.get_running_loop().time() > publish_deadline:
+                    if self.debug:
+                        await self.save_debug_screenshot(page, "publish_timeout")
+                    raise RuntimeError(
+                        f"点击「发布」后超过 {self.publish_timeout_seconds}s 仍未跳转到作品管理页，"
+                        "发布可能没成功。请到抖音创作者中心确认作品列表；调试截图见 logs/debug/"
+                    )
                 douyin_logger.info(_msg("🏃", "小人正在冲刺发布视频"))
-                if self.debug:
-                    await page.screenshot(full_page=True)
                 await asyncio.sleep(0.5)
 
         await context.storage_state(path=self.account_file)
@@ -663,6 +765,7 @@ class DouYinNote(DouYinBaseUploader):
         debug: bool = DEBUG_MODE,
         headless: bool = LOCAL_CHROME_HEADLESS,
         location: str = "",
+        dry_run: bool = False,
     ):
         super().__init__(
             publish_date=publish_date,
@@ -670,6 +773,7 @@ class DouYinNote(DouYinBaseUploader):
             publish_strategy=publish_strategy,
             debug=debug,
             headless=headless,
+            dry_run=dry_run,
         )
         self.image_paths = image_paths
         self.note = note or ""
@@ -707,6 +811,7 @@ class DouYinNote(DouYinBaseUploader):
         await asyncio.sleep(random.uniform(0.3, 0.8))
         await page.locator("div[class^='container'] input[accept*='image']").set_input_files(self.image_paths)
 
+        image_upload_deadline = asyncio.get_running_loop().time() + self.upload_timeout_seconds
         while True:
             try:
                 await page.wait_for_url(
@@ -716,6 +821,12 @@ class DouYinNote(DouYinBaseUploader):
                 douyin_logger.info(_msg("🥳", "已经进入图文发布页面"))
                 break
             except Exception:
+                if asyncio.get_running_loop().time() > image_upload_deadline:
+                    if self.debug:
+                        await self.save_debug_screenshot(page, "note_upload_timeout")
+                    raise RuntimeError(
+                        f"图片上传等待超过 {self.upload_timeout_seconds}s 仍未结束，已放弃本次发布；调试截图见 logs/debug/"
+                    )
                 douyin_logger.debug(_msg("🧍", "小人还在等图片上传完成"))
                 await asyncio.sleep(0.5)
 
@@ -736,6 +847,11 @@ class DouYinNote(DouYinBaseUploader):
         # 发布前最后检查停顿
         await asyncio.sleep(random.uniform(0.8, 1.8))
 
+        if self.dry_run:
+            await self.finish_dry_run(page, context, browser, "图文")
+            return
+
+        note_publish_deadline = asyncio.get_running_loop().time() + self.publish_timeout_seconds
         while True:
             try:
                 publish_button = page.get_by_role("button", name="发布", exact=True)
@@ -748,6 +864,13 @@ class DouYinNote(DouYinBaseUploader):
                 douyin_logger.success(_msg("🥳", "图文发布成功，小人开心收工"))
                 break
             except Exception:
+                if asyncio.get_running_loop().time() > note_publish_deadline:
+                    if self.debug:
+                        await self.save_debug_screenshot(page, "note_publish_timeout")
+                    raise RuntimeError(
+                        f"点击「发布」后超过 {self.publish_timeout_seconds}s 仍未跳转到作品管理页，"
+                        "发布可能没成功；调试截图见 logs/debug/"
+                    )
                 douyin_logger.info(_msg("🏃", "小人正在冲刺发布图文"))
                 await asyncio.sleep(0.5)
 
@@ -756,7 +879,7 @@ class DouYinNote(DouYinBaseUploader):
         await self.validate_upload_args()
         douyin_logger.info(_msg("🥳", "图文上传前检查通过"))
 
-        browser = await playwright.chromium.launch(headless=self.headless, channel="chrome")
+        browser = await _launch_browser(playwright, headless=self.headless)
         context = await browser.new_context(
             storage_state=f"{self.account_file}",
             permissions=["geolocation"],
